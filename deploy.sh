@@ -41,19 +41,19 @@ fi
 SSH_OPTS="-o ConnectTimeout=10 -o StrictHostKeyChecking=no -p ${SSH_PORT}"
 
 # ---- 1. 构建前端 ----
-log "Step 1/5: 构建前端..."
+log "Step 1/7: 构建前端..."
 cd frontend
 npm run build --silent 2>/dev/null || npm run build
 log "前端构建完成"
 cd ..
 
 # ---- 2. 将前端产物嵌入后端 static 目录 ----
-log "Step 2/5: 嵌入前端到后端 static..."
+log "Step 2/7: 嵌入前端到后端 static..."
 rm -rf backend/src/main/resources/static/assets backend/src/main/resources/static/index.html
 cp -r frontend/dist/* backend/src/main/resources/static/
 
 # ---- 3. Maven 构建（前端已打包在内）----
-log "Step 3/5: Maven 构建后端 JAR..."
+log "Step 3/7: Maven 构建后端 JAR..."
 cd backend
 mvn clean package -DskipTests -B -q || err "Maven 构建失败，请检查 JDK/Maven 版本"
 JAR_FILE=$(ls target/ttms-*.jar | head -1)
@@ -61,13 +61,13 @@ log "构建完成: ${JAR_FILE}"
 cd ..
 
 # ---- 4. 检查远程连接 ----
-log "Step 4/5: 连接 ECS ${SSH_USER}@${ECS_HOST}:${SSH_PORT}..."
+log "Step 4/7: 连接 ECS ${SSH_USER}@${ECS_HOST}:${SSH_PORT}..."
 if ! ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "echo ok" &>/dev/null; then
     err "无法连接 ECS，请检查 IP / 用户名 / 端口"
 fi
 
 # ---- 5. 上传 JAR 到 ECS ----
-log "Step 5/5: 上传文件..."
+log "Step 5/7: 上传文件..."
 
 # 在 ECS 上停止旧进程
 ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "
@@ -99,16 +99,17 @@ ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "
 
 log "Step 7/7: 配置环境变量并启动..."
 
-# 生成启动脚本
-ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "cat > ${REMOTE_DIR}/bin/start.sh << 'SCRIPT'
+# 生成启动脚本（本地，密码直接嵌入，避免 sed 特殊字符问题）
+START_SCRIPT=$(mktemp)
+cat > "$START_SCRIPT" << SCRIPT
 #!/usr/bin/env bash
 cd ${REMOTE_DIR}
 
-# === 生产环境变量（请根据实际情况修改）===
+# === 生产环境变量 ===
 export SERVER_PORT=${APP_PORT}
 export DB_URL=jdbc:mysql://localhost:3306/TTMS?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
 export DB_USERNAME=root
-export DB_PASSWORD=__DB_PASSWORD__
+export DB_PASSWORD='${DB_PWD}'
 export JWT_SECRET=TTMS2024ProductionSecretKeyAtLeast32CharsChangeMe!
 export JWT_EXPIRATION=86400000
 export ADMIN_USERNAME=admin
@@ -118,26 +119,28 @@ export LOG_PATH=${REMOTE_DIR}/logs/
 export CORS_ORIGINS=http://${ECS_HOST}:${APP_PORT}
 
 # JVM 参数
-JAVA_OPTS=\"-Xms256m -Xmx512m -XX:+UseG1GC -Djava.security.egd=file:/dev/./urandom\"
+JAVA_OPTS="-Xms256m -Xmx512m -XX:+UseG1GC -Djava.security.egd=file:/dev/./urandom"
 
 # 启动
-nohup java \$JAVA_OPTS -jar ${REMOTE_DIR}/bin/app.jar \
-    --spring.profiles.active=prod \
-    --server.port=\${SERVER_PORT} \
+nohup java \$JAVA_OPTS -jar ${REMOTE_DIR}/bin/app.jar \\
+    --spring.profiles.active=prod \\
+    --server.port=\${SERVER_PORT} \\
     > ${REMOTE_DIR}/logs/app.log 2>&1 &
 
 echo \$! > ${REMOTE_DIR}/bin/app.pid
-echo \"TTMS 已启动，PID=\$(cat ${REMOTE_DIR}/bin/app.pid)\"
-echo \"日志: tail -f ${REMOTE_DIR}/logs/app.log\"
+echo "TTMS 已启动，PID=\$(cat ${REMOTE_DIR}/bin/app.pid)"
+echo "日志: tail -f ${REMOTE_DIR}/logs/app.log"
 SCRIPT
-chmod +x ${REMOTE_DIR}/bin/start.sh
-# 替换数据库密码
-sed -i 's/__DB_PASSWORD__/${DB_PWD}/' ${REMOTE_DIR}/bin/start.sh"
+
+# 上传启动脚本
+scp -P ${SSH_PORT} "$START_SCRIPT" "${SSH_USER}@${ECS_HOST}:${REMOTE_DIR}/bin/start.sh"
+ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "chmod +x ${REMOTE_DIR}/bin/start.sh"
+rm -f "$START_SCRIPT"
 
 # 执行启动
 ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "bash ${REMOTE_DIR}/bin/start.sh"
 
-# ---- 6. 配置 systemd 服务（开机自启）----
+# ---- 配置 systemd 服务（开机自启）----
 log "配置 systemd 开机自启..."
 ssh ${SSH_OPTS} "${SSH_USER}@${ECS_HOST}" "cat > /etc/systemd/system/ttms.service << 'UNIT'
 [Unit]
@@ -159,13 +162,13 @@ UNIT
 systemctl daemon-reload
 systemctl enable ttms.service 2>/dev/null || true"
 
-# ---- 7. 等待就绪 ----
+# ---- 等待就绪 ----
 log "等待服务启动..."
 for i in \$(seq 1 30); do
     if curl -sf "http://${ECS_HOST}:${APP_PORT}/actuator/health" >/dev/null 2>&1; then
         echo ""
         echo "========================================"
-        echo -e "  \${GREEN}部署成功！\${NC}"
+        echo -e "  ${GREEN}部署成功！${NC}"
         echo ""
         echo "  访问地址: http://${ECS_HOST}:${APP_PORT}"
         echo ""
